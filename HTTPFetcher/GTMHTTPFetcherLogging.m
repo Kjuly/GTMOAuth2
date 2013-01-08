@@ -20,6 +20,13 @@
 
 #import "GTMHTTPFetcherLogging.h"
 
+// Sensitive credential strings are replaced in logs with _snip_
+//
+// Apps that must see the contents of sensitive tokens can set this to 1
+#ifndef SKIP_GTM_FETCH_LOGGING_SNIPPING
+#define SKIP_GTM_FETCH_LOGGING_SNIPPING 0
+#endif
+
 // If GTMReadMonitorInputStream is available, it can be used for
 // capturing uploaded streams of data
 //
@@ -33,10 +40,13 @@
 @end
 
 // If GTMNSJSONSerialization is available, it is used for formatting JSON
+#if (TARGET_OS_MAC && !TARGET_OS_IPHONE && (MAC_OS_X_VERSION_MAX_ALLOWED < 1070)) || \
+  (TARGET_OS_IPHONE && (__IPHONE_OS_VERSION_MAX_ALLOWED < 50000))
 @interface GTMNSJSONSerialization : NSObject
 + (NSData *)dataWithJSONObject:(id)obj options:(NSUInteger)opt error:(NSError **)error;
 + (id)JSONObjectWithData:(NSData *)data options:(NSUInteger)opt error:(NSError **)error;
 @end
+#endif
 
 // Otherwise, if SBJSON is available, it is used for formatting JSON
 @interface GTMFetcherSBJSON
@@ -284,6 +294,51 @@ static NSString* gLoggingProcessName = nil;
   }
 }
 
+- (void)setLogRequestBody:(NSString *)bodyString {
+  @synchronized(self) {
+    [logRequestBody_ release];
+    logRequestBody_ = [bodyString copy];
+  }
+}
+
+- (NSString *)logRequestBody {
+  @synchronized(self) {
+    return logRequestBody_;
+  }
+}
+
+- (void)setLogResponseBody:(NSString *)bodyString {
+  @synchronized(self) {
+    [logResponseBody_ release];
+    logResponseBody_ = [bodyString copy];
+  }
+}
+
+- (NSString *)logResponseBody {
+  @synchronized(self) {
+    return logResponseBody_;
+  }
+}
+
+- (void)setShouldDeferResponseBodyLogging:(BOOL)flag {
+  @synchronized(self) {
+    if (flag != shouldDeferResponseBodyLogging_) {
+      shouldDeferResponseBodyLogging_ = flag;
+      if (!flag) {
+        [self performSelectorOnMainThread:@selector(logFetchWithError:)
+                               withObject:nil
+                            waitUntilDone:NO];
+      }
+    }
+  }
+}
+
+- (BOOL)shouldDeferResponseBodyLogging {
+  @synchronized(self) {
+    return shouldDeferResponseBodyLogging_;
+  }
+}
+
 // stringFromStreamData creates a string given the supplied data
 //
 // If NSString can create a UTF-8 string from the data, then that is returned.
@@ -518,16 +573,16 @@ static NSString* gLoggingProcessName = nil;
 
   // write the date & time, the comment, and the link to the plain-text
   // (copyable) log
-  NSString *dateLineFormat = @"<b>%@ &nbsp;&nbsp;&nbsp;&nbsp; ";
+  NSString *const dateLineFormat = @"<b>%@ &nbsp;&nbsp;&nbsp;&nbsp; ";
   [outputHTML appendFormat:dateLineFormat, [NSDate date]];
 
   NSString *comment = [self comment];
   if (comment) {
-    NSString *commentFormat = @"%@ &nbsp;&nbsp;&nbsp;&nbsp; ";
+    NSString *const commentFormat = @"%@ &nbsp;&nbsp;&nbsp;&nbsp; ";
     [outputHTML appendFormat:commentFormat, comment];
   }
 
-  NSString *reqRespFormat = @"</b><a href='%@'><i>request/response log</i></a><br>";
+  NSString *const reqRespFormat = @"</b><a href='%@'><i>request/response log</i></a><br>";
   [outputHTML appendFormat:reqRespFormat, copyableFileName];
 
   // write the request URL
@@ -570,8 +625,7 @@ static NSString* gLoggingProcessName = nil;
     [outputHTML appendFormat:@"&nbsp;&nbsp; headers: %d  %@<br>",
      (int)numberOfRequestHeaders, headerDetails];
   } else {
-    [outputHTML appendFormat:@"&nbsp;&nbsp; headers: none<br>",
-     (int)numberOfRequestHeaders];
+    [outputHTML appendFormat:@"&nbsp;&nbsp; headers: none<br>"];
   }
 
   // write the request post data, toggleable
@@ -592,22 +646,28 @@ static NSString* gLoggingProcessName = nil;
     [outputHTML appendFormat:@"&nbsp;&nbsp; data: %d bytes, <code>%@</code><br>\n",
      (int)postDataLength, postType ? postType : @"<no type>"];
 
-    postDataStr = [self stringFromStreamData:postData
-                                 contentType:postType];
-    if (postDataStr) {
-      // remove OAuth 2 client secret and refresh token
-      postDataStr = [[self class] snipSubstringOfString:postDataStr
-                                     betweenStartString:@"client_secret="
-                                              endString:@"&"];
+    if (logRequestBody_) {
+      postDataStr = [[logRequestBody_ copy] autorelease];
+      [logRequestBody_ release];
+      logRequestBody_ = nil;
+    } else {
+      postDataStr = [self stringFromStreamData:postData
+                                   contentType:postType];
+      if (postDataStr) {
+        // remove OAuth 2 client secret and refresh token
+        postDataStr = [[self class] snipSubstringOfString:postDataStr
+                                       betweenStartString:@"client_secret="
+                                                endString:@"&"];
 
-      postDataStr = [[self class] snipSubstringOfString:postDataStr
-                                     betweenStartString:@"refresh_token="
-                                              endString:@"&"];
+        postDataStr = [[self class] snipSubstringOfString:postDataStr
+                                       betweenStartString:@"refresh_token="
+                                                endString:@"&"];
 
-      // remove ClientLogin password
-      postDataStr = [[self class] snipSubstringOfString:postDataStr
-                                     betweenStartString:@"&Passwd="
-                                              endString:@"&"];
+        // remove ClientLogin password
+        postDataStr = [[self class] snipSubstringOfString:postDataStr
+                                       betweenStartString:@"&Passwd="
+                                                endString:@"&"];
+      }
     }
   } else {
     // no post data
@@ -628,7 +688,7 @@ static NSString* gLoggingProcessName = nil;
             NSString *jsonCode = [[jsonError valueForKey:@"code"] description];
             NSString *jsonMessage = [jsonError valueForKey:@"message"];
             if (jsonCode || jsonMessage) {
-              NSString *jsonErrFmt = @"&nbsp;&nbsp;&nbsp;<i>JSON error:</i> <FONT"
+              NSString *const jsonErrFmt = @"&nbsp;&nbsp;&nbsp;<i>JSON error:</i> <FONT"
                 @" COLOR='#FF00FF'>%@ %@ &nbsp;&#x2691;</FONT>"; // 2691 = ⚑
               statusString = [statusString stringByAppendingFormat:jsonErrFmt,
                               jsonCode ? jsonCode : @"",
@@ -639,7 +699,7 @@ static NSString* gLoggingProcessName = nil;
       } else {
         // purple for anything other than 200 or 201
         NSString *flag = (status >= 400 ? @"&nbsp;&#x2691;" : @""); // 2691 = ⚑
-        NSString *statusFormat = @"<FONT COLOR='#FF00FF'>%ld %@</FONT>";
+        NSString *const statusFormat = @"<FONT COLOR='#FF00FF'>%ld %@</FONT>";
         statusString = [NSString stringWithFormat:statusFormat,
                         (long)status, flag];
       }
@@ -650,7 +710,7 @@ static NSString* gLoggingProcessName = nil;
     NSURL *responseURL = [response URL];
 
     if (responseURL && ![responseURL isEqual:[request URL]]) {
-      NSString *responseURLFormat = @"<FONT COLOR='#FF00FF'>response URL:"
+      NSString *const responseURLFormat = @"<FONT COLOR='#FF00FF'>response URL:"
         "</FONT> <code>%@</code><br>\n";
       responseURLStr = [NSString stringWithFormat:responseURLFormat,
         [responseURL absoluteString]];
@@ -691,13 +751,13 @@ static NSString* gLoggingProcessName = nil;
       // Make a small inline image that links to the full image file
       [outputHTML appendFormat:@"&nbsp;&nbsp; data: %d bytes, <code>%@</code><br>",
        (int)responseDataLength, responseMIMEType];
-      NSString *fmt = @"<a href=\"%@\"><img src='%@' alt='image'"
+      NSString *const fmt = @"<a href=\"%@\"><img src='%@' alt='image'"
         " style='border:solid thin;max-height:32'></a>\n";
       [outputHTML appendFormat:fmt,
        escapedResponseFile, escapedResponseFile];
     } else {
       // The response data was XML; link to the xml file
-      NSString *fmt = @"&nbsp;&nbsp; data: %d bytes, <code>"
+      NSString *const fmt = @"&nbsp;&nbsp; data: %d bytes, <code>"
         "%@</code>&nbsp;&nbsp;&nbsp;<i><a href=\"%@\">%@</a></i>\n";
       [outputHTML appendFormat:fmt,
        (int)responseDataLength, responseMIMEType,
@@ -738,8 +798,26 @@ static NSString* gLoggingProcessName = nil;
     [copyable appendFormat:@"Response body: (%u bytes)\n",
      (unsigned int) responseDataLength];
     if (responseDataLength > 0) {
+      if (logResponseBody_) {
+        responseDataStr = [[logResponseBody_ copy] autorelease];
+        [logResponseBody_ release];
+        logResponseBody_ = nil;
+      }
       if (responseDataStr != nil) {
         [copyable appendFormat:@"%@\n", responseDataStr];
+      } else if (status >= 400 && [temporaryDownloadPath_ length] > 0) {
+        // Try to read in the saved data, which is probably a server error
+        // message
+        NSStringEncoding enc;
+        responseDataStr = [NSString stringWithContentsOfFile:temporaryDownloadPath_
+                                                usedEncoding:&enc
+                                                       error:NULL];
+        if ([responseDataStr length] > 0) {
+          [copyable appendFormat:@"%@\n", responseDataStr];
+        } else {
+          [copyable appendFormat:@"<<%u bytes to file>>\n",
+           (unsigned int) responseDataLength];
+        }
       } else {
         // Even though it's redundant, we'll put in text to indicate that all
         // the bytes are binary
@@ -890,7 +968,9 @@ static NSString* gLoggingProcessName = nil;
 + (NSString *)snipSubstringOfString:(NSString *)originalStr
                  betweenStartString:(NSString *)startStr
                           endString:(NSString *)endStr {
-
+#if SKIP_GTM_FETCH_LOGGING_SNIPPING
+  return originalStr;
+#else
   if (originalStr == nil) return nil;
 
   // Find the start string, and replace everything between it
@@ -919,6 +999,7 @@ static NSString* gLoggingProcessName = nil;
   NSString *result = [originalStr stringByReplacingCharactersInRange:replaceRange
                                                           withString:@"_snip_"];
   return result;
+#endif // SKIP_GTM_FETCH_LOGGING_SNIPPING
 }
 
 + (NSString *)headersStringForDictionary:(NSDictionary *)dict {

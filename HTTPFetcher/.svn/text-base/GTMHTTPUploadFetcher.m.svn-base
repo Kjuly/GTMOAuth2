@@ -28,6 +28,7 @@ static NSUInteger const kQueryServerForOffset = NSUIntegerMax;
 @property (readwrite, retain) NSData *downloadedData;
 - (void)releaseCallbacks;
 - (void)connectionDidFinishLoading:(NSURLConnection *)connection;
+- (void)connection:(NSURLConnection *)connection didFailWithError:(NSError *)error;
 @end
 
 @interface GTMHTTPUploadFetcher ()
@@ -38,7 +39,7 @@ static NSUInteger const kQueryServerForOffset = NSUIntegerMax;
       uploadFileHandle:(NSFileHandle *)fileHandle
         uploadMIMEType:(NSString *)uploadMIMEType
              chunkSize:(NSUInteger)chunkSize;
-  
+
 - (void)uploadNextChunkWithOffset:(NSUInteger)offset;
 - (void)uploadNextChunkWithOffset:(NSUInteger)offset
                 fetcherProperties:(NSMutableDictionary *)props;
@@ -209,7 +210,7 @@ totalBytesExpectedToSend:(NSInteger)totalBytesExpected;
       // first time through, seek to end to determine file length
       uploadFileHandleLength_ = (NSInteger) [uploadFileHandle_ seekToEndOfFile];
     }
-    return uploadFileHandleLength_;
+    return (NSUInteger)uploadFileHandleLength_;
   }
 }
 
@@ -354,6 +355,18 @@ totalBytesExpectedToSend:totalBytesExpectedToWrite];
   [self releaseCallbacks];
 }
 
+- (void)connection:(NSURLConnection *)connection didFailWithError:(NSError *)error {
+  // handle failure of the initial fetch as a simple fetcher failure, including
+  // calling the delegate, and allowing retry to happen if appropriate
+  SEL prevSel = finishedSel_;  // should be null
+  finishedSel_ = delegateFinishedSEL_;
+  [super connection:connection didFailWithError:error];
+
+  // If retry later happens and succeeds, it shouldn't message the delegate
+  // since we'll continue to chunk uploads.
+  finishedSel_ = prevSel;
+}
+
 - (void)connectionDidFinishLoading:(NSURLConnection *)connection {
 
   // we land here once the initial fetch sending the initial POST body
@@ -447,14 +460,15 @@ totalBytesExpectedToSend:totalBytesExpectedToWrite];
     // resuming, so we'll initially send an empty data block and wait for the
     // server to tell us where the current offset really is
     chunkData = [NSData data];
-    rangeStr = [NSString stringWithFormat:@"bytes */%lu", dataLen];
+    rangeStr = [NSString stringWithFormat:@"bytes */%llu",
+                (unsigned long long)dataLen];
     lengthStr = @"0";
     offset = 0;
   } else {
     // uploading the next data chunk
 #if DEBUG
-    NSAssert2(offset < dataLen, @"offset %lu exceeds data length %lu",
-              offset, dataLen);
+    NSAssert2(offset < dataLen, @"offset %llu exceeds data length %llu",
+              (unsigned long long)offset, (unsigned long long)dataLen);
 #endif
 
     NSUInteger thisChunkSize = chunkSize;
@@ -473,9 +487,12 @@ totalBytesExpectedToSend:totalBytesExpectedToWrite];
     chunkData = [self uploadSubdataWithOffset:offset
                                        length:thisChunkSize];
 
-    rangeStr = [NSString stringWithFormat:@"bytes %lu-%lu/%lu",
-                          offset, offset + thisChunkSize - 1, dataLen];
-    lengthStr = [NSString stringWithFormat:@"%lu", thisChunkSize];
+    rangeStr = [NSString stringWithFormat:@"bytes %llu-%llu/%llu",
+                (unsigned long long)offset,
+                (unsigned long long)(offset + thisChunkSize - 1),
+                (unsigned long long)dataLen];
+    lengthStr = [NSString stringWithFormat:@"%llu",
+                 (unsigned long long)thisChunkSize];
   }
 
   // track the current offset for progress reporting
@@ -510,6 +527,7 @@ totalBytesExpectedToSend:totalBytesExpectedToWrite];
   GTMHTTPFetcher *chunkFetcher;
 
   chunkFetcher = [GTMHTTPFetcher fetcherWithRequest:chunkRequest];
+  [chunkFetcher setDelegateQueue:[self delegateQueue]];
   [chunkFetcher setRunLoopModes:[self runLoopModes]];
 
   // if the upload fetcher has a comment, use the same comment for chunks
@@ -580,7 +598,7 @@ totalBytesExpectedToSend:0];
   [self setResponseHeaders:[chunkFetcher responseHeaders]];
 
   if (error) {
-    int status = [error code];
+    int status = (int)[error code];
 
     // status 308 is "resume incomplete", meaning we should get the offset
     // from the Range header and upload the next chunk
@@ -606,7 +624,7 @@ totalBytesExpectedToSend:0];
   #if DEBUG
     NSInteger status = [chunkFetcher statusCode];
     NSAssert1(status == 200 || status == 201,
-              @"unexpected chunks status %d", status);
+              @"unexpected chunks status %d", (int)status);
   #endif
 
     // take the chunk fetcher's data as our own
@@ -625,7 +643,7 @@ totalBytesExpectedToSend:0];
     [self invokeFinalCallbacksWithData:data
                                  error:error
               shouldInvalidateLocation:YES];
-    
+
     [self destroyChunkFetcher];
   }
 }
@@ -650,7 +668,7 @@ totalBytesExpectedToSend:0];
         && [scanner scanLongLong:&rangeStart]
         && [scanner scanString:@"-" intoString:nil]
         && [scanner scanLongLong:&rangeEnd]) {
-      newOffset = rangeEnd + 1;
+      newOffset = (NSUInteger)rangeEnd + 1;
     }
   }
 
@@ -699,12 +717,12 @@ totalBytesExpectedToSend:0];
                                 willRetry:willRetry
                                     error:error];
   }
-  
+
 #if NS_BLOCKS_AVAILABLE
   if (retryBlock_) {
     willRetry = retryBlock_(willRetry, error);
   }
-#endif  
+#endif
 
   if (willRetry) {
     // change the request being retried into a query to the server to
@@ -712,7 +730,8 @@ totalBytesExpectedToSend:0];
     NSMutableURLRequest *chunkRequest = [chunkFetcher mutableRequest];
 
     NSUInteger dataLen = [self fullUploadLength];
-    NSString *rangeStr = [NSString stringWithFormat:@"bytes */%lu", dataLen];
+    NSString *rangeStr = [NSString stringWithFormat:@"bytes */%llu",
+                          (unsigned long long)dataLen];
 
     [chunkRequest setValue:rangeStr forHTTPHeaderField:@"Content-Range"];
     [chunkRequest setValue:@"0" forHTTPHeaderField:@"Content-Length"];
@@ -741,28 +760,28 @@ totalBytesExpectedToSend:(NSInteger)totalBytesExpected {
   // the actual total bytes sent include the initial XML sent, plus the
   // offset into the batched data prior to this fetcher
   totalBytesSent += initialBodySent_ + currentOffset_;
-  
+
   // the total bytes expected include the initial XML and the full chunked
   // data, independent of how big this fetcher's chunk is
-  totalBytesExpected = initialBodyLength_ + [self fullUploadLength];
-  
+  totalBytesExpected = (NSInteger)(initialBodyLength_ + [self fullUploadLength]);
+
   if (delegate_ && delegateSentDataSEL_) {
     // ensure the chunk fetcher survives the callback in case the user pauses
     // the upload process
     [[chunkFetcher retain] autorelease];
-    
+
     [self invokeSentDataCallback:delegateSentDataSEL_
                           target:delegate_
                  didSendBodyData:bytesSent
                totalBytesWritten:totalBytesSent
        totalBytesExpectedToWrite:totalBytesExpected];
   }
-  
+
 #if NS_BLOCKS_AVAILABLE
   if (sentDataBlock_) {
     sentDataBlock_(bytesSent, totalBytesSent, totalBytesExpected);
   }
-#endif  
+#endif
 }
 
 #pragma mark -
